@@ -1,0 +1,9 @@
+{
+  "groupId": "com.example",
+  "artifactId": "my-multi-module-project",
+  "version": "1.0.0",
+  "type": "pom",
+  "scope": "",
+  "classifier": "",
+  "optional": "false"
+}

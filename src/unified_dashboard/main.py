@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import shutil
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,8 @@ class PatchSuggestion:
     suggested_version: Optional[str] = None
     update_level: int = 0  # 0 = no patch, 1 = direct dependency, 2+ = transitive
     is_patchable: bool = False
+    managed_in_parent_pom: bool = False
+    parent_pom_path: Optional[Path] = None
 
 
 class MavenRepository:
@@ -93,7 +96,7 @@ class MavenRepository:
             logger.debug(f"Querying Maven Central for {group_id}:{artifact_id}")
 
             req = Request(url)
-            with urlopen(req, timeout=60) as response:
+            with urlopen(req, timeout=120) as response:
                 data = json.loads(response.read().decode())
 
             versions = []
@@ -142,29 +145,9 @@ class DependencyTreeParser:
     def parse(json_data: dict) -> Optional[DependencyNode]:
         """Parse Maven dependency tree JSON and return root node."""
         try:
-            # Look for root project info first
-            if 'groupId' in json_data and 'artifactId' in json_data:
-                root = DependencyTreeParser._parse_node(json_data)
-                DependencyTreeParser._build_paths(root, [])
-                return root
-
-            # Handle the structure where dependencies are at root level
-            if 'dependencies' in json_data:
-                dependencies = json_data['dependencies']
-                if dependencies:
-                    # This case implies a list of dependencies without a single root project
-                    # Create a dummy root to hold them
-                    root = DependencyNode("dummy", "project", "0.0.0")
-                    for dep_data in dependencies:
-                        child = DependencyTreeParser._parse_node(dep_data)
-                        child.parent = root
-                        root.children.append(child)
-                    DependencyTreeParser._build_paths(root, [])
-                    return root
-
-            logger.error("Unable to identify root node in dependency tree JSON")
-            return None
-
+            root = DependencyTreeParser._parse_node(json_data)
+            DependencyTreeParser._build_paths(root, [])
+            return root
         except KeyError as e:
             logger.error(f"Missing required field in dependency tree JSON: {e}")
             return None
@@ -185,7 +168,7 @@ class DependencyTreeParser:
         )
 
         # Parse children
-        children_data = node_data.get('dependencies', [])
+        children_data = node_data.get('children', [])
         for child_data in children_data:
             child = DependencyTreeParser._parse_node(child_data)
             child.parent = node
@@ -267,7 +250,7 @@ class FortifyReportParser:
 
                         # Extract CVE and severity information
                         cve_ids = []
-                        severity = "UNKNOWN"
+                        severity = vuln_elem.get("instanceSeverity", "UNKNOWN")
                         
                         notes_str = "fvdl:AnalyzerNotes" if namespace else "AnalyzerNotes"
                         analyzer_notes = vuln_elem.find(notes_str, namespace)
@@ -384,8 +367,14 @@ class FortifyReportParser:
 class MavenProjectManager:
     """Manages Maven project operations."""
 
-    def __init__(self, pom_path: str):
-        self.pom_path = Path(pom_path)
+    def __init__(self, path: str):
+        self.path = Path(path)
+        if self.path.is_file():
+            self.pom_path = self.path
+            self.project_dir = self.path.parent
+        else:
+            self.project_dir = self.path
+            self.pom_path = self.project_dir / 'pom.xml'
         self.backup_path = None
 
     def backup_pom(self):
@@ -401,32 +390,60 @@ class MavenProjectManager:
             self.backup_path.unlink()  # Remove backup
             logger.debug("Restored POM from backup")
 
+    def get_modules(self) -> List[str]:
+        """Parse the POM file and return the list of modules."""
+        try:
+            tree = ET.parse(self.pom_path)
+            root = tree.getroot()
+            
+            namespace = ''
+            if '}' in root.tag:
+                namespace = f"{{{root.tag.split('}')[0][1:]}}}"
+
+            modules = []
+            modules_element = root.find(f"{namespace}modules")
+            if modules_element is not None:
+                for module_element in modules_element.findall(f"{namespace}module"):
+                    if module_element.text:
+                        modules.append(module_element.text)
+            
+            return modules
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse POM file: {self.pom_path}")
+            return []
+
     def get_dependency_tree_json(self) -> Optional[dict]:
         """Get dependency tree as JSON."""
+        if not shutil.which("mvn"):
+            logger.error("Maven executable not found in PATH. Please install Maven and make sure it is in your PATH.")
+            sys.exit(1)
+
         try:
-            result = subprocess.run([
-                'mvn', 'dependency:tree', 
-                '-DoutputType=json',
-                f'-DoutputFile={self.pom_path.parent}/dependency-tree.json'
-            ], 
-            cwd=self.pom_path.parent,
-            capture_output=True, 
-            text=True,
-            timeout=300
+            output_file = self.project_dir.resolve() / 'dependency-tree.json'
+            command = f'mvn -f "{self.pom_path.resolve()}" dependency:tree -DoutputType=json -DoutputFile="{output_file}"'
+            result = subprocess.run(
+                command,
+                cwd=self.project_dir,
+                capture_output=True, 
+                text=True,
+                timeout=120,
+                shell=True
             )
 
             if result.returncode != 0:
                 logger.error(f"Maven dependency:tree failed: {result.stderr}")
                 return None
 
-            tree_file = self.pom_path.parent / 'dependency-tree.json'
-            if tree_file.exists():
-                with open(tree_file, 'r') as f:
-                    data = json.load(f)
-                tree_file.unlink()  # Clean up
-                return data
+            if not output_file.exists():
+                logger.warning(f"Dependency tree file not created for {self.project_dir}")
+                logger.debug(f"Maven stdout: {result.stdout}")
+                logger.debug(f"Maven stderr: {result.stderr}")
+                return None
 
-            return None
+            with open(output_file, 'r') as f:
+                data = json.load(f)
+            output_file.unlink()  # Clean up
+            return data
 
         except subprocess.TimeoutExpired:
             logger.error("Maven dependency:tree command timed out")
@@ -435,42 +452,97 @@ class MavenProjectManager:
             logger.error(f"Maven command failed: {e}")
             return None
 
+    def is_dependency_managed(self, dependency: DependencyNode) -> bool:
+        """Check if a dependency is managed in the POM file."""
+        try:
+            tree = ET.parse(self.pom_path)
+            root = tree.getroot()
+            
+            namespace = ''
+            if '}' in root.tag:
+                namespace = f"{{{root.tag.split('}')[0][1:]}}}"
+
+            dep_management = root.find(f"{namespace}dependencyManagement")
+            if dep_management is not None:
+                dependencies = dep_management.find(f"{namespace}dependencies")
+                if dependencies is not None:
+                    for dep in dependencies.findall(f"{namespace}dependency"):
+                        group_id = dep.findtext(f"{namespace}groupId")
+                        artifact_id = dep.findtext(f"{namespace}artifactId")
+                        if group_id == dependency.group_id and artifact_id == dependency.artifact_id:
+                            return True
+            return False
+        except ET.ParseError:
+            return False
+
+
+class MultiModuleMavenProjectManager(MavenProjectManager):
+    """Manages multi-module Maven projects."""
+
+    def __init__(self, project_dir: str):
+        super().__init__(project_dir)
+        self.modules: List[str] = []
+
+    def discover_modules(self):
+        """Discover all modules in the project."""
+        self.modules = self.get_modules()
+        logger.info(f"Discovered modules: {self.modules}")
+
+    def get_all_dependency_trees(self) -> Dict[str, dict]:
+        """Get dependency trees for all modules."""
+        trees = {}
+        
+        for module in self.modules:
+            module_path = self.project_dir / module
+            if module_path.is_dir():
+                logger.info(f"Getting dependency tree for module: {module}")
+                module_manager = MavenProjectManager(str(module_path))
+                tree = module_manager.get_dependency_tree_json()
+                if tree:
+                    trees[module] = tree
+        
+        return trees
+
 
 class VulnerabilityPatcher:
     """Main class for patching vulnerabilities."""
 
-    def __init__(self, pom_path: str, include_prereleases: bool = False, dry_run: bool = False):
-        self.maven_manager = MavenProjectManager(pom_path)
+    def __init__(self, project_manager: MavenProjectManager, include_prereleases: bool = False, dry_run: bool = False):
+        self.project_manager = project_manager
         self.include_prereleases = include_prereleases
         self.dry_run = dry_run
         self.patch_suggestions: List[PatchSuggestion] = []
 
-    def analyze_vulnerabilities(self, fortify_report_path: str, dependency_tree_json: dict) -> List[PatchSuggestion]:
+    def analyze_vulnerabilities(self, fortify_report_path: str, dependency_trees: Dict[str, dict]) -> List[PatchSuggestion]:
         """Analyze vulnerabilities and generate patch suggestions."""
 
-        # Parse inputs
         vulnerable_packages = FortifyReportParser.parse(fortify_report_path)
         if not vulnerable_packages:
             logger.warning("No vulnerabilities found in Fortify report")
             return []
 
-        root_node = DependencyTreeParser.parse(dependency_tree_json)
-        if not root_node:
-            logger.error("Failed to parse dependency tree")
-            return []
+        logger.info(f"Analyzing {len(vulnerable_packages)} vulnerabilities across {len(dependency_trees)} modules")
 
-        logger.info(f"Analyzing {len(vulnerable_packages)} vulnerabilities")
-
-        # Analyze each vulnerability
         suggestions = []
         for vuln_pkg in vulnerable_packages:
-            suggestion = self._analyze_single_vulnerability(vuln_pkg, root_node)
-            suggestions.append(suggestion)
+            found_in_module = False
+            for module_name, tree_data in dependency_trees.items():
+                root_node = DependencyTreeParser.parse(tree_data)
+                if root_node:
+                    vulnerable_node, path = self._find_vulnerable_package_in_tree(vuln_pkg, root_node)
+                    if vulnerable_node:
+                        logger.info(f"Found vulnerable package {vuln_pkg.coordinates} in module {module_name}")
+                        suggestion = self._analyze_single_vulnerability(vuln_pkg, root_node, module_name)
+                        suggestions.append(suggestion)
+                        found_in_module = True
+                        break  # Move to the next vulnerability
+            if not found_in_module:
+                logger.warning(f"Vulnerable package not found in any dependency tree: {vuln_pkg.coordinates}")
 
         self.patch_suggestions = suggestions
         return suggestions
 
-    def _analyze_single_vulnerability(self, vuln_pkg: VulnerablePackage, root_node: DependencyNode) -> PatchSuggestion:
+    def _analyze_single_vulnerability(self, vuln_pkg: VulnerablePackage, root_node: DependencyNode, module_name: str) -> PatchSuggestion:
         """Analyze a single vulnerability and generate patch suggestion."""
 
         # Find the vulnerable package in dependency tree
@@ -488,7 +560,7 @@ class VulnerabilityPatcher:
         logger.info(f"Dependency path: {' → '.join([node.coordinates for node in path])}")
 
         # Try to find patch by updating dependencies in path
-        patch_suggestion = self._find_patch_in_path(vuln_pkg, path)
+        patch_suggestion = self._find_patch_in_path(vuln_pkg, path, module_name)
 
         return patch_suggestion
 
@@ -514,7 +586,7 @@ class VulnerabilityPatcher:
 
         return search_node(root_node, [])
 
-    def _find_patch_in_path(self, vuln_pkg: VulnerablePackage, path: List[DependencyNode]) -> PatchSuggestion:
+    def _find_patch_in_path(self, vuln_pkg: VulnerablePackage, path: List[DependencyNode], module_name: str) -> PatchSuggestion:
         """Find patch by testing updates along the dependency path."""
 
         if len(path) <= 1:  # Only root node
@@ -528,7 +600,11 @@ class VulnerabilityPatcher:
         for i in range(1, len(path)):
             current_node = path[i]
 
-            logger.info(f"Checking if updating {current_node.coordinates} resolves vulnerability")
+            is_managed = self.project_manager.is_dependency_managed(current_node)
+            if is_managed:
+                logger.info(f"Dependency {current_node.coordinates} is managed in the root POM.")
+
+            logger.info(f"Checking if updating {current_node.coordinates} resolves vulnerability in module {module_name}")
 
             # Get latest version
             latest_version = MavenRepository.get_latest_version(
@@ -547,12 +623,6 @@ class VulnerabilityPatcher:
 
             logger.info(f"Latest version available: {latest_version}")
 
-            # In a real implementation, we would:
-            # 1. Update POM file with new version
-            # 2. Run mvn dependency:tree to get new tree
-            # 3. Check if vulnerable package is still present
-            # For this example, we'll assume the update would work if it's a newer version
-
             if self._would_update_resolve_vulnerability(current_node, latest_version, vuln_pkg):
                 return PatchSuggestion(
                     vulnerable_package=vuln_pkg,
@@ -560,7 +630,9 @@ class VulnerabilityPatcher:
                     suggested_update=current_node,
                     suggested_version=latest_version,
                     update_level=i,
-                    is_patchable=True
+                    is_patchable=True,
+                    managed_in_parent_pom=is_managed,
+                    parent_pom_path=self.project_manager.pom_path if is_managed else None
                 )
 
         # No patch found by updating dependencies
@@ -624,7 +696,10 @@ class VulnerabilityPatcher:
                 report.append(f"   ")
                 report.append(f"   SOLUTION: Update {suggestion.suggested_update.coordinates}")
                 report.append(f"   to version {suggestion.suggested_version}")
-                if suggestion.update_level == 1:
+                if suggestion.managed_in_parent_pom:
+                    report.append(f"   This dependency is managed in the parent POM: {suggestion.parent_pom_path}")
+                    report.append(f"   Update the version in the <dependencyManagement> section of the parent POM.")
+                elif suggestion.update_level == 1:
                     report.append(f"   This is a direct dependency update.")
                 else:
                     report.append(f"   This will automatically update transitive dependencies.")
@@ -667,7 +742,9 @@ class VulnerabilityPatcher:
                 finding["suggested_update"] = {
                     "dependency": suggestion.suggested_update.coordinates,
                     "new_version": suggestion.suggested_version,
-                    "update_level": suggestion.update_level
+                    "update_level": suggestion.update_level,
+                    "managed_in_parent_pom": suggestion.managed_in_parent_pom,
+                    "parent_pom_path": str(suggestion.parent_pom_path) if suggestion.parent_pom_path else None
                 }
 
             report_data["findings"].append(finding)
@@ -691,7 +768,9 @@ class VulnerabilityPatcher:
             "Is Patchable",
             "Suggested Update",
             "New Version",
-            "Update Level"
+            "Update Level",
+            "Managed in Parent POM",
+            "Parent POM Path"
         ])
 
         # Data rows
@@ -704,7 +783,9 @@ class VulnerabilityPatcher:
                 suggestion.is_patchable,
                 suggestion.suggested_update.coordinates if suggestion.suggested_update else "",
                 suggestion.suggested_version or "",
-                suggestion.update_level
+                suggestion.update_level,
+                suggestion.managed_in_parent_pom,
+                str(suggestion.parent_pom_path) if suggestion.parent_pom_path else ""
             ])
 
         return output.getvalue()
@@ -717,9 +798,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --fortify-report report.xml --dependency-tree deps.json
-  %(prog)s --fortify-report report.xml --dependency-tree deps.json --dry-run
-  %(prog)s --fortify-report report.xml --dependency-tree deps.json --output-format json
+  %(prog)s --fortify-report report.xml --project-dir /path/to/maven/project
+  %(prog)s --fortify-report report.xml --dependency-tree-dir /path/to/json/dir
         """
     )
 
@@ -730,15 +810,14 @@ Examples:
     )
 
     parser.add_argument(
-        '--dependency-tree', 
-        required=True,
-        help='Path to Maven dependency tree JSON file'
+        '--project-dir', 
+        default='.',
+        help='Path to the root of the Maven project (default: current directory)'
     )
 
     parser.add_argument(
-        '--pom-file', 
-        default='pom.xml',
-        help='Path to project POM file (default: pom.xml)'
+        '--dependency-tree-dir',
+        help='Path to a directory containing dependency tree JSON files (optional)'
     )
 
     parser.add_argument(
@@ -774,33 +853,126 @@ Examples:
     logger.setLevel(log_level)
 
     try:
-        # Validate inputs
-        if not Path(args.fortify_report).exists():
-            logger.error(f"Fortify report file not found: {args.fortify_report}")
+        project_path = Path(args.project_dir)
+        if project_path.is_file() and "pom" in project_path.name.lower() and project_path.name.lower().endswith('.xml'):
+            # Single POM file provided
+            project_manager = MavenProjectManager(str(project_path))
+            # For single pom, we need to get the tree for that specific pom
+            dependency_trees = {'root': project_manager.get_dependency_tree_json()}
+        elif project_path.is_dir():
+            # Multi-module project or single project directory
+            project_manager = MultiModuleMavenProjectManager(str(project_path))
+            project_manager.discover_modules()
+
+            dependency_trees = {}
+            if args.dependency_tree_dir:
+                # Load from directory
+                tree_dir = Path(args.dependency_tree_dir)
+                for json_file in tree_dir.glob('*.json'):
+                    module_name = json_file.stem
+                    with open(json_file, 'r') as f:
+                        dependency_trees[module_name] = json.load(f)
+            else:
+                # Generate dependency trees
+                dependency_trees = project_manager.get_all_dependency_trees()
+        else:
+            logger.error(f"Invalid project path: {args.project_dir}. Must be a directory or a pom.xml file.")
             sys.exit(1)
 
-        if not Path(args.dependency_tree).exists():
-            logger.error(f"Dependency tree file not found: {args.dependency_tree}")
+        if not dependency_trees:
+            logger.error("Could not load or generate any dependency trees.")
             sys.exit(1)
 
-        if not Path(args.pom_file).exists():
-            logger.error(f"POM file not found: {args.pom_file}")
-            sys.exit(1)
-
-        # Load dependency tree JSON
-        with open(args.dependency_tree, 'r') as f:
-            dependency_tree_data = json.load(f)
-
-        # Initialize patcher
         patcher = VulnerabilityPatcher(
-            pom_path=args.pom_file,
+            project_manager=project_manager,
             include_prereleases=args.include_prereleases,
             dry_run=args.dry_run
         )
 
         # Analyze vulnerabilities
         logger.info("Starting vulnerability analysis...")
-        suggestions = patcher.analyze_vulnerabilities(args.fortify_report, dependency_tree_data)
+        suggestions = patcher.analyze_vulnerabilities(args.fortify_report, dependency_trees)
+
+        # Generate and display report
+        report = patcher.generate_report(args.output_format)
+        print(report)
+
+        # Exit with appropriate code
+        patchable_count = sum(1 for s in suggestions if s.is_patchable)
+        if patchable_count > 0:
+            logger.info(f"Analysis complete. Found {patchable_count} patchable vulnerabilities.")
+            sys.exit(0)
+        else:
+            logger.warning("No patchable vulnerabilities found.")
+            sys.exit(1)
+
+        if not dependency_trees:
+            logger.error("Could not load or generate any dependency trees.")
+            sys.exit(1)
+
+        patcher = VulnerabilityPatcher(
+            project_manager=project_manager,
+            include_prereleases=args.include_prereleases,
+            dry_run=args.dry_run
+        )
+
+        # Analyze vulnerabilities
+        logger.info("Starting vulnerability analysis...")
+        suggestions = patcher.analyze_vulnerabilities(args.fortify_report, dependency_trees)
+
+        # Generate and display report
+        report = patcher.generate_report(args.output_format)
+        print(report)
+
+        # Exit with appropriate code
+        patchable_count = sum(1 for s in suggestions if s.is_patchable)
+        if patchable_count > 0:
+            logger.info(f"Analysis complete. Found {patchable_count} patchable vulnerabilities.")
+            sys.exit(0)
+        else:
+            logger.warning("No patchable vulnerabilities found.")
+            sys.exit(1)
+
+        if not dependency_trees:
+            logger.error("Could not load or generate any dependency trees.")
+            sys.exit(1)
+
+        patcher = VulnerabilityPatcher(
+            project_manager=project_manager,
+            include_prereleases=args.include_prereleases,
+            dry_run=args.dry_run
+        )
+
+        # Analyze vulnerabilities
+        logger.info("Starting vulnerability analysis...")
+        suggestions = patcher.analyze_vulnerabilities(args.fortify_report, dependency_trees)
+
+        # Generate and display report
+        report = patcher.generate_report(args.output_format)
+        print(report)
+
+        # Exit with appropriate code
+        patchable_count = sum(1 for s in suggestions if s.is_patchable)
+        if patchable_count > 0:
+            logger.info(f"Analysis complete. Found {patchable_count} patchable vulnerabilities.")
+            sys.exit(0)
+        else:
+            logger.warning("No patchable vulnerabilities found.")
+            sys.exit(1)
+
+        if not dependency_trees:
+            logger.error("Could not load or generate any dependency trees.")
+            sys.exit(1)
+
+        patcher = VulnerabilityPatcher(
+            project_manager=project_manager,
+            include_prereleases=args.include_prereleases,
+            dry_run=args.dry_run
+        )
+
+        # Analyze vulnerabilities
+        logger.info("Starting vulnerability analysis...")
+        suggestions = patcher.analyze_vulnerabilities(args.fortify_report, dependency_trees)
 
         # Generate and display report
         report = patcher.generate_report(args.output_format)

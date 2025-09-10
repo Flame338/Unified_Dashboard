@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FVDL version="1.18" xmlns="xmlns://www.fortifysoftware.com/schema/fvdl">
+    <CreatedTS date="2025-09-10" time="19:03:00"/>
+    <Vulnerabilities>
+        <Vulnerability instanceSeverity="High">
+            <ClassInfo>
+                <Type>Dependency Check</Type>
+                <Subtype>Vulnerable Component</Subtype>
+            </ClassInfo>
+            <InstanceInfo>
+                <InstanceID>vuln-1</InstanceID>
+                <Location path="/project/.m2/repository/org/apache/commons/commons-text/1.8/commons-text-1.8.jar" line="0"/>
+            </InstanceInfo>
+            <AnalyzerNotes>
+                <UserInfo>CVE-2023-12345: Apache Commons Text vulnerable to code injection</UserInfo>
+            </AnalyzerNotes>
+        </Vulnerability>
+        <Vulnerability instanceSeverity="Critical">
+            <ClassInfo>
+                <Type>Dependency Check</Type>
+                <Subtype>Vulnerable Component</Subtype>
+            </ClassInfo>
+            <InstanceInfo>
+                <InstanceID>vuln-2</InstanceID>
+                <Location path="/project/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.12.1/jackson-databind-2.12.1.jar" line="0"/>
+            </InstanceInfo>
+            <AnalyzerNotes>
+                <UserInfo>CVE-2023-67890: Jackson Databind deserialization vulnerability</UserInfo>
+            </AnalyzerNotes>
+        </Vulnerability>
+    </Vulnerabilities>
+    <Description>
+        <Abstract>Fortify scan results showing dependency vulnerabilities</Abstract>
+    </Description>
+</FVDL>
