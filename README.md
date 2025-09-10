@@ -49,7 +49,7 @@ pip install maven-fortify-patcher
 ### Basic Usage
 
 ```bash
-maven-fortify-patcher --fortify-report report.xml --dependency-tree deps.json
+uv run unified-dashboard --fortify-report <path_to_fortify_report.xml> --project-dir <path_to_pom.xml> --dependency-tree-dir <path_to_dependency_tree_json_dir>
 ```
 
 ### Generate Dependency Tree
@@ -75,14 +75,14 @@ ReportGenerator -format XML -source project.fpr -f vulnerability-report.xml
 ### Command Line Options
 
 ```bash
-maven-fortify-patcher [OPTIONS]
+uv run unified-dashboard [OPTIONS]
 
 Required Arguments:
   --fortify-report PATH     Path to Fortify vulnerability report XML
-  --dependency-tree PATH    Path to Maven dependency tree JSON
+  --project-dir PATH        Path to the root of the Maven project or a specific POM file
+  --dependency-tree-dir PATH Path to a directory containing dependency tree JSON files
 
 Optional Arguments:
-  --pom-file PATH          Path to project POM file (default: pom.xml)
   --include-prereleases    Include pre-release versions in updates
   --dry-run               Analyze without making changes
   --output-format FORMAT  Output format: text|json|csv (default: text)
@@ -94,34 +94,38 @@ Optional Arguments:
 
 #### Basic Analysis
 ```bash
-maven-fortify-patcher \
+uv run unified-dashboard \
   --fortify-report fortify-scan.xml \
-  --dependency-tree dependency-tree.json
+  --project-dir /path/to/your/pom.xml \
+  --dependency-tree-dir /path/to/your/dependency/tree/json/directory
 ```
 
 #### Dry Run with JSON Output
 ```bash
-maven-fortify-patcher \
+uv run unified-dashboard \
   --fortify-report fortify-scan.xml \
-  --dependency-tree dependency-tree.json \
+  --project-dir /path/to/your/pom.xml \
+  --dependency-tree-dir /path/to/your/dependency/tree/json/directory \
   --dry-run \
   --output-format json > analysis-results.json
 ```
 
 #### Include Pre-release Versions
 ```bash
-maven-fortify-patcher \
+uv run unified-dashboard \
   --fortify-report fortify-scan.xml \
-  --dependency-tree dependency-tree.json \
+  --project-dir /path/to/your/pom.xml \
+  --dependency-tree-dir /path/to/your/dependency/tree/json/directory \
   --include-prereleases \
   --log-level DEBUG
 ```
 
 #### Generate CSV Report
 ```bash
-maven-fortify-patcher \
+uv run unified-dashboard \
   --fortify-report fortify-scan.xml \
-  --dependency-tree dependency-tree.json \
+  --project-dir /path/to/your/pom.xml \
+  --dependency-tree-dir /path/to/your/dependency/tree/json/directory \
   --output-format csv > vulnerability-analysis.csv
 ```
 
